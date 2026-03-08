@@ -8,6 +8,9 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/types"
+
+	"github.com/beezly/terraform-provider-unifi/internal/client"
+	"github.com/beezly/terraform-provider-unifi/internal/resources"
 )
 
 // Ensure UnifiProvider satisfies various provider interfaces.
@@ -75,20 +78,20 @@ func (p *UnifiProvider) Configure(ctx context.Context, req provider.ConfigureReq
 		return
 	}
 
-	client := &UnifiClient{
-		ApiKey:        data.ApiKey.ValueString(),
-		ApiUrl:        data.ApiUrl.ValueString(),
-		SiteId:        data.SiteId.ValueString(),
-		AllowInsecure: data.AllowInsecure.ValueBool(),
-	}
+	c := client.New(
+		data.ApiKey.ValueString(),
+		data.ApiUrl.ValueString(),
+		data.SiteId.ValueString(),
+		data.AllowInsecure.ValueBool(),
+	)
 
-	resp.DataSourceData = client
-	resp.ResourceData = client
+	resp.DataSourceData = c
+	resp.ResourceData = c
 }
 
 func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
-		// TODO: wire in generated resources
+		resources.NewNetworkResource,
 	}
 }
 
