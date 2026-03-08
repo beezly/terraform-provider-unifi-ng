@@ -41,7 +41,7 @@ func (c *Client) SiteID() string { return c.siteID }
 
 // do executes an HTTP request against the UniFi API.
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, int, error) {
-	url := fmt.Sprintf("%s/proxy/network%s", c.baseURL, path)
+	url := fmt.Sprintf("%s/proxy/network/integration%s", c.baseURL, path)
 
 	var bodyReader io.Reader
 	if body != nil {

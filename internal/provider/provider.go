@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/types"
 
 	"github.com/beezly/terraform-provider-unifi/internal/client"
+	"github.com/beezly/terraform-provider-unifi/internal/datasources"
 	"github.com/beezly/terraform-provider-unifi/internal/resources"
 )
 
@@ -97,6 +98,7 @@ func (p *UnifiProvider) Resources(_ context.Context) []func() resource.Resource 
 
 func (p *UnifiProvider) DataSources(_ context.Context) []func() datasource.DataSource {
 	return []func() datasource.DataSource{
-		// TODO: wire in generated data sources
+		datasources.NewSitesDataSource,
+		datasources.NewDevicesDataSource,
 	}
 }
