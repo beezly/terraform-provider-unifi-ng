@@ -3,7 +3,9 @@ package resources
 import (
 	"context"
 	"fmt"
+	"strings"
 
+	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
@@ -37,18 +39,27 @@ type NetworkModel struct {
 	DhcpEnabled types.Bool   `tfsdk:"dhcp_enabled"`
 }
 
-// networkAPIPayload is what we send/receive from the UniFi API.
+// networkAPIPayload is the UniFi network object (used for both create/update and read).
+// Single-resource GET returns this directly (no "data" wrapper).
+// List GET returns { "data": [...] }.
 type networkAPIPayload struct {
-	ID          string `json:"id,omitempty"`
-	Name        string `json:"name"`
-	Enabled     *bool  `json:"enabled,omitempty"`
-	VlanID      *int64 `json:"vlanId,omitempty"`
-	IPSubnet    string `json:"ipSubnet,omitempty"`
-	DHCPEnabled *bool  `json:"dhcpEnabled,omitempty"`
+	ID      string `json:"id,omitempty"`
+	Name    string `json:"name"`
+	Enabled *bool  `json:"enabled,omitempty"`
+	VlanID  *int64 `json:"vlanId,omitempty"`
+
+	// IPv4 config is nested; we flatten it for Terraform
+	IPv4Configuration *networkIPv4Config `json:"ipv4Configuration,omitempty"`
 }
 
-type networkAPIResponse struct {
-	Data networkAPIPayload `json:"data"`
+type networkIPv4Config struct {
+	HostIPAddress     string              `json:"hostIpAddress,omitempty"`
+	PrefixLength      int                 `json:"prefixLength,omitempty"`
+	DHCPConfiguration *networkDHCPConfig  `json:"dhcpConfiguration,omitempty"`
+}
+
+type networkDHCPConfig struct {
+	Mode string `json:"mode"` // "SERVER" = enabled, "NONE" = disabled
 }
 
 func (r *NetworkResource) Metadata(_ context.Context, req resource.MetadataRequest, resp *resource.MetadataResponse) {
@@ -112,7 +123,7 @@ func (r *NetworkResource) Create(ctx context.Context, req resource.CreateRequest
 	}
 
 	payload := modelToPayload(plan)
-	var result networkAPIResponse
+	var result networkAPIPayload
 	err := r.client.Post(ctx,
 		fmt.Sprintf("/v1/sites/%s/networks", r.client.SiteID()),
 		payload, &result)
@@ -121,7 +132,7 @@ func (r *NetworkResource) Create(ctx context.Context, req resource.CreateRequest
 		return
 	}
 
-	payloadToModel(&result.Data, &plan)
+	payloadToModel(&result, &plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -132,7 +143,7 @@ func (r *NetworkResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 
-	var result networkAPIResponse
+	var result networkAPIPayload
 	err := r.client.Get(ctx,
 		fmt.Sprintf("/v1/sites/%s/networks/%s", r.client.SiteID(), state.ID.ValueString()),
 		&result)
@@ -141,7 +152,7 @@ func (r *NetworkResource) Read(ctx context.Context, req resource.ReadRequest, re
 		return
 	}
 
-	payloadToModel(&result.Data, &state)
+	payloadToModel(&result, &state)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -153,7 +164,7 @@ func (r *NetworkResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 
 	payload := modelToPayload(plan)
-	var result networkAPIResponse
+	var result networkAPIPayload
 	err := r.client.Put(ctx,
 		fmt.Sprintf("/v1/sites/%s/networks/%s", r.client.SiteID(), plan.ID.ValueString()),
 		payload, &result)
@@ -162,7 +173,7 @@ func (r *NetworkResource) Update(ctx context.Context, req resource.UpdateRequest
 		return
 	}
 
-	payloadToModel(&result.Data, &plan)
+	payloadToModel(&result, &plan)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &plan)...)
 }
 
@@ -181,21 +192,8 @@ func (r *NetworkResource) Delete(ctx context.Context, req resource.DeleteRequest
 }
 
 func (r *NetworkResource) ImportState(ctx context.Context, req resource.ImportStateRequest, resp *resource.ImportStateResponse) {
-	// Import by network UUID
-	var state NetworkModel
-	state.ID = types.StringValue(req.ID)
-
-	var result networkAPIResponse
-	err := r.client.Get(ctx,
-		fmt.Sprintf("/v1/sites/%s/networks/%s", r.client.SiteID(), req.ID),
-		&result)
-	if err != nil {
-		resp.Diagnostics.AddError("Error importing network", err.Error())
-		return
-	}
-
-	payloadToModel(&result.Data, &state)
-	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
+	// Set the ID in state; framework will call Read to populate the rest.
+	resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
 }
 
 // modelToPayload converts the Terraform model to the API payload.
@@ -211,14 +209,45 @@ func modelToPayload(m NetworkModel) networkAPIPayload {
 		v := m.VlanID.ValueInt64()
 		p.VlanID = &v
 	}
+
+	// Build IPv4 config from flat Terraform attributes
 	if !m.IPSubnet.IsNull() && !m.IPSubnet.IsUnknown() {
-		p.IPSubnet = m.IPSubnet.ValueString()
+		subnet := m.IPSubnet.ValueString()
+		// Parse CIDR: "192.168.3.0/24" → host "192.168.3.1", prefix 24
+		host, prefix := parseCIDR(subnet)
+		dhcpMode := "NONE"
+		if !m.DhcpEnabled.IsNull() && !m.DhcpEnabled.IsUnknown() && m.DhcpEnabled.ValueBool() {
+			dhcpMode = "SERVER"
+		}
+		p.IPv4Configuration = &networkIPv4Config{
+			HostIPAddress: host,
+			PrefixLength:  prefix,
+			DHCPConfiguration: &networkDHCPConfig{
+				Mode: dhcpMode,
+			},
+		}
 	}
-	if !m.DhcpEnabled.IsNull() && !m.DhcpEnabled.IsUnknown() {
-		v := m.DhcpEnabled.ValueBool()
-		p.DHCPEnabled = &v
-	}
+
 	return p
+}
+
+// parseCIDR extracts host IP and prefix length from a CIDR string.
+// Returns the network address + 1 as the gateway/host IP.
+func parseCIDR(cidr string) (string, int) {
+	parts := strings.SplitN(cidr, "/", 2)
+	if len(parts) != 2 {
+		return cidr, 24
+	}
+	prefix := 24
+	fmt.Sscanf(parts[1], "%d", &prefix)
+	// Convert network address to gateway (x.x.x.0 → x.x.x.1)
+	ip := parts[0]
+	octets := strings.Split(ip, ".")
+	if len(octets) == 4 && octets[3] == "0" {
+		octets[3] = "1"
+		ip = strings.Join(octets, ".")
+	}
+	return ip, prefix
 }
 
 // payloadToModel maps the API response back into the Terraform model.
@@ -231,10 +260,20 @@ func payloadToModel(p *networkAPIPayload, m *NetworkModel) {
 	if p.VlanID != nil {
 		m.VlanID = types.Int64Value(*p.VlanID)
 	}
-	if p.IPSubnet != "" {
-		m.IPSubnet = types.StringValue(p.IPSubnet)
-	}
-	if p.DHCPEnabled != nil {
-		m.DhcpEnabled = types.BoolValue(*p.DHCPEnabled)
+	// Always set dhcp_enabled (default false) so state is never null
+	m.DhcpEnabled = types.BoolValue(false)
+	if p.IPv4Configuration != nil {
+		cfg := p.IPv4Configuration
+		if cfg.HostIPAddress != "" && cfg.PrefixLength > 0 {
+			// Reconstruct CIDR: gateway "192.168.3.1" + prefix 24 → "192.168.3.0/24"
+			octets := strings.Split(cfg.HostIPAddress, ".")
+			if len(octets) == 4 {
+				octets[3] = "0"
+				m.IPSubnet = types.StringValue(fmt.Sprintf("%s/%d", strings.Join(octets, "."), cfg.PrefixLength))
+			}
+		}
+		if cfg.DHCPConfiguration != nil {
+			m.DhcpEnabled = types.BoolValue(cfg.DHCPConfiguration.Mode == "SERVER")
+		}
 	}
 }
